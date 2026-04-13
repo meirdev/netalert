@@ -1,0 +1,50 @@
+[package]
+name = "netalert"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "signal", "process"] }
+
+# Config parsing
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# IP/CIDR handling
+ipnet = { version = "2", features = ["serde"] }
+ip_network = "0.4"
+ip_network_table = "0.2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Flow parsing
+rustflow = { package = "rustflow_lib", version = "0.6.0", features = ["tokio"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Enum string utilities
+strum = { version = "0.27", features = ["derive"] }
+
+# Prometheus metrics endpoint
+tiny_http = "0.12"
+
+uuid = { version = "1.22.0", features = ["serde", "v4"] }
+duration-str = "0.21.0"
+fxhash = "0.2.1"
+
+[lib]
+name = "netalert"
+path = "src/lib.rs"
+
+[[bin]]
+name = "netalert"
+path = "src/main.rs"
