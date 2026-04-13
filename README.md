@@ -26,7 +26,7 @@ Options:
 
 ## Configuration
 
-NetAlert is configured via a YAML file. See [config.yaml](config.yaml) for a full example.
+NetAlert is configured via a YAML file.
 
 ```yaml
 global:
