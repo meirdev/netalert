@@ -1,4 +1,9 @@
-# NetAlert
+<div align="center">
+  <img src="./assets/logo-full-dark.svg" alt="NetAlert Logo" width="500"/>
+</div>
+
+&nbsp;
+&nbsp;
 
 NetAlert monitors network traffic flows from routers and network devices, evaluates traffic rates against configurable thresholds, and generates alerts with BGP Flow Spec mitigation recommendations for DDoS defense.
 

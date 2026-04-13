@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 280" width="900" height="280">
+  <defs>
+    <!-- Radar sweep cone -->
+    <linearGradient id="sweep" x1="0%" y1="0%" x2="100%" y2="0%" gradientTransform="rotate(-45, 0.5, 0.5)">
+      <stop offset="0%" stop-color="#00D4FF" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#00D4FF" stop-opacity="0.15"/>
+    </linearGradient>
+    <clipPath id="iconClip">
+      <circle cx="0" cy="0" r="115"/>
+    </clipPath>
+    <radialGradient id="alertGlow5" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FF4D4D" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#FF4D4D" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Dot grid pattern -->
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="12" cy="12" r="0.8" fill="#00D4FF" opacity="0.15"/>
+    </pattern>
+  </defs>
+
+  <!-- Dark background -->
+  <rect width="900" height="280" rx="16" fill="#0B1622"/>
+
+  <!-- Dot grid overlay -->
+  <rect width="900" height="280" rx="16" fill="url(#dots)"/>
+
+  <!-- === ICON SECTION === -->
+  <g transform="translate(140, 140)">
+    <!-- Radar sweep cone -->
+    <g clip-path="url(#iconClip)">
+      <path d="M 0 0 L 80 -80 L 115 0 Z" fill="url(#sweep)" opacity="0.6"/>
+      <path d="M 0 0 L 115 0 L 80 80 Z" fill="url(#sweep)" opacity="0.3"/>
+    </g>
+
+    <!-- Outer hexagonal ring -->
+    <polygon points="0,-110 95,-55 95,55 0,110 -95,55 -95,-55"
+             fill="none" stroke="#00D4FF" stroke-width="1" stroke-opacity="0.2"/>
+    <!-- Inner hexagonal ring -->
+    <polygon points="0,-70 61,-35 61,35 0,70 -61,35 -61,-35"
+             fill="none" stroke="#00D4FF" stroke-width="1" stroke-opacity="0.35"/>
+
+    <!-- Scanning circle -->
+    <circle cx="0" cy="0" r="95" fill="none" stroke="#00D4FF" stroke-width="0.8" stroke-opacity="0.15"
+            stroke-dasharray="4 8"/>
+
+    <!-- Network connections - hex vertices to center -->
+    <g stroke="#00D4FF" stroke-width="1.2" stroke-opacity="0.25">
+      <!-- Outer to inner connections -->
+      <line x1="0" y1="-110" x2="0" y2="-70"/>
+      <line x1="95" y1="-55" x2="61" y2="-35"/>
+      <line x1="95" y1="55" x2="61" y2="35"/>
+      <line x1="0" y1="110" x2="0" y2="70"/>
+      <line x1="-95" y1="55" x2="-61" y2="35"/>
+      <line x1="-95" y1="-55" x2="-61" y2="-35"/>
+
+      <!-- Inner to center -->
+      <line x1="0" y1="-70" x2="0" y2="0"/>
+      <line x1="61" y1="-35" x2="0" y2="0"/>
+      <line x1="61" y1="35" x2="0" y2="0"/>
+      <line x1="0" y1="70" x2="0" y2="0"/>
+      <line x1="-61" y1="35" x2="0" y2="0"/>
+      <line x1="-61" y1="-35" x2="0" y2="0"/>
+
+      <!-- Cross connections on inner hex -->
+      <line x1="0" y1="-70" x2="61" y2="-35"/>
+      <line x1="61" y1="-35" x2="61" y2="35"/>
+      <line x1="61" y1="35" x2="0" y2="70"/>
+      <line x1="0" y1="70" x2="-61" y2="35"/>
+      <line x1="-61" y1="35" x2="-61" y2="-35"/>
+      <line x1="-61" y1="-35" x2="0" y2="-70"/>
+    </g>
+
+    <!-- Outer hex nodes -->
+    <g fill="#0B1622" stroke="#00D4FF" stroke-width="1.5">
+      <circle cx="0" cy="-110" r="5"/>
+      <circle cx="95" cy="-55" r="5"/>
+      <circle cx="95" cy="55" r="5"/>
+      <circle cx="0" cy="110" r="5"/>
+      <circle cx="-95" cy="55" r="5"/>
+      <circle cx="-95" cy="-55" r="5"/>
+    </g>
+
+    <!-- Inner hex nodes -->
+    <g fill="#00D4FF">
+      <circle cx="0" cy="-70" r="4.5"/>
+      <circle cx="61" cy="-35" r="4.5"/>
+      <circle cx="61" cy="35" r="4.5"/>
+      <circle cx="0" cy="70" r="4.5"/>
+      <circle cx="-61" cy="35" r="4.5"/>
+      <circle cx="-61" cy="-35" r="4.5"/>
+    </g>
+
+    <!-- Alert glow -->
+    <circle cx="0" cy="0" r="40" fill="url(#alertGlow5)"/>
+
+    <!-- Central alert node - bell/notification shape -->
+    <circle cx="0" cy="0" r="14" fill="#FF4D4D"/>
+    <circle cx="0" cy="0" r="20" fill="none" stroke="#FF4D4D" stroke-width="1.5" stroke-opacity="0.5"/>
+    <circle cx="0" cy="0" r="28" fill="none" stroke="#FF4D4D" stroke-width="1" stroke-opacity="0.25"/>
+
+    <!-- Exclamation -->
+    <g fill="#FFFFFF">
+      <rect x="-2" y="-8" width="4" height="10" rx="1.5"/>
+      <circle cx="0" cy="6" r="2.5"/>
+    </g>
+  </g>
+
+  <!-- === TEXT SECTION === -->
+  <g transform="translate(290, 152)">
+    <!-- "Net" in cyan -->
+    <text font-family="'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+          font-size="76" font-weight="800" fill="#00D4FF" letter-spacing="-2">
+      Net
+    </text>
+    <!-- "Alert" -->
+    <text x="118" font-family="'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+          font-size="76" font-weight="300" fill="#E8F0F2" letter-spacing="-2">
+      Alert
+    </text>
+
+    <!-- Underline accent -->
+    <line x1="0" y1="12" x2="310" y2="12" stroke="#00D4FF" stroke-width="1" stroke-opacity="0.3"/>
+    <!-- Alert pulse on the line -->
+    <polyline points="120,12 140,12 148,-4 156,20 164,-2 170,14 176,6 182,12 310,12"
+              fill="none" stroke="#FF4D4D" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  </g>
+</svg>
