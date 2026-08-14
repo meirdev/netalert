@@ -322,13 +322,16 @@ fn find_best_candidate(
             };
 
             // Score balances coverage and specificity:
-            //   score = coverage_ratio * (1.0 + 0.1 * field_count)
-            // More fields get a bonus, but can't overcome a large coverage drop.
-            // Example: protocol=tcp at 100% scores 1.0*1.1=1.1
-            //          {protocol=tcp, dst_port=7873} at 96.6% scores 0.966*1.2=1.16 ← wins
-            //          {src_ip=X, protocol, dst_port} at 10% scores 0.1*1.3=0.13 ← too
+            //   score = coverage_ratio * (1.0 + 0.5 * field_count)
+            // An extra field wins as long as it keeps roughly >= 80% of the
+            // broader rule's coverage — the share it sheds is typically the
+            // legitimate traffic that differs in that field (e.g. established
+            // HTTPS vs a SYN flood). A large coverage drop still loses.
+            // Example: {protocol=tcp, dst_port=443} at 100% scores 1.0*2.0=2.0
+            //          {protocol, dst_port, tcp_flags=syn} at 85% scores 0.85*2.5=2.125 ← wins
+            //          {src_ip=X, protocol, dst_port} at 10% scores 0.1*2.5=0.25 ← too
             // narrow
-            let score = coverage * (1.0 + 0.1 * candidate.fields.count() as f64);
+            let score = coverage * (1.0 + 0.5 * candidate.fields.count() as f64);
 
             let dominated = match &best {
                 None => true,
@@ -442,6 +445,25 @@ pub fn analyze_flows(
 
         let candidate = match find_best_candidate(&remaining, MIN_COVERAGE_RATIO, exclude_fields) {
             Some(c) => c,
+            // No field combination reaches the coverage floor (e.g. an ICMP
+            // flood from fully spoofed sources has no ports or flags to pivot
+            // on). If the alert's protocol category already pins a protocol
+            // or port, a rule built from just those forced fields is still an
+            // effective mitigation — but only as a first rule: once specific
+            // rules exist, a blanket protocol rule would overblock what they
+            // deliberately left alone.
+            None if rules.is_empty()
+                && (forced_protocol.is_some() || forced_dst_port.is_some()) =>
+            {
+                Candidate {
+                    fields: FieldSet(0),
+                    src_ip: None,
+                    dst_port: None,
+                    src_port: None,
+                    protocol: None,
+                    tcp_flags: None,
+                }
+            }
             None => break,
         };
 
@@ -529,19 +551,47 @@ mod tests {
 
     use super::*;
 
-    fn flow(dst: [u8; 4], bytes: u64) -> FlowRecord {
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    fn prefix24() -> IpNet {
+        "10.2.3.0/24".parse().unwrap()
+    }
+
+    fn attack_flow(
+        src: IpAddr,
+        dst: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: u8,
+        tcp_flags: u8,
+        bytes: u64,
+    ) -> FlowRecord {
         FlowRecord {
-            src_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-            dst_ip: IpAddr::V4(Ipv4Addr::from(dst)),
-            src_port: 1234,
-            dst_port: 80,
-            protocol: 6,
-            tcp_flags: 0x02,
+            src_ip: src,
+            dst_ip: dst,
+            src_port,
+            dst_port,
+            protocol,
+            tcp_flags,
             bytes,
             packets: 1,
             time_received: 0,
             sampling_rate: 1,
         }
+    }
+
+    fn flow(dst: [u8; 4], bytes: u64) -> FlowRecord {
+        attack_flow(
+            v4(192, 0, 2, 1),
+            IpAddr::V4(Ipv4Addr::from(dst)),
+            1234,
+            80,
+            6,
+            0x02,
+            bytes,
+        )
     }
 
     #[test]
@@ -572,5 +622,298 @@ mod tests {
 
         let result = compute_destination_prefix(&flows, Direction::Inbound, prefix, 0.8);
         assert_eq!(result, prefix);
+    }
+
+    // --- Common DDoS attack scenarios against analyze_flows ---
+
+    #[test]
+    fn syn_flood_from_spoofed_sources() {
+        // Classic SYN flood: 100 spoofed sources with random ephemeral ports,
+        // all sending SYNs to the web server on 443.
+        let victim = v4(10, 2, 3, 7);
+        let flows: Vec<FlowRecord> = (0..100u16)
+            .map(|i| {
+                attack_flow(
+                    v4(203, 0, 113, i as u8),
+                    victim,
+                    20000 + i,
+                    443,
+                    6,
+                    0x02,
+                    1500,
+                )
+            })
+            .collect();
+
+        let rules = analyze_flows(
+            &flows,
+            prefix24(),
+            Direction::Inbound,
+            ProtocolCategory::TcpSyn,
+            1000.0,
+            100.0,
+        );
+
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert_eq!(rule.destination_prefix, "10.2.3.7/32");
+        assert_eq!(rule.destination_ports, vec![443]);
+        assert_eq!(rule.protocols, vec!["tcp"]);
+        assert_eq!(rule.tcp_flags, vec!["syn"]);
+        // Sources are spoofed — the rule must not pin a single source.
+        assert_eq!(rule.source_prefix, None);
+    }
+
+    #[test]
+    fn dns_amplification_reflection() {
+        // DNS reflection: many open resolvers answer from src port 53 to
+        // random ephemeral ports on the victim.
+        let victim = v4(10, 2, 3, 7);
+        let flows: Vec<FlowRecord> = (0..80u16)
+            .map(|i| {
+                attack_flow(
+                    v4(198, 51, 100, i as u8),
+                    victim,
+                    53,
+                    30000 + i,
+                    17,
+                    0,
+                    4096,
+                )
+            })
+            .collect();
+
+        let rules = analyze_flows(
+            &flows,
+            prefix24(),
+            Direction::Inbound,
+            ProtocolCategory::Udp,
+            5000.0,
+            500.0,
+        );
+
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert_eq!(rule.destination_prefix, "10.2.3.7/32");
+        assert_eq!(rule.source_ports, vec![53]);
+        assert_eq!(rule.protocols, vec!["udp"]);
+        // Victim-side ports are ephemeral — must not appear in the rule.
+        assert!(rule.destination_ports.is_empty());
+    }
+
+    #[test]
+    fn ntp_amplification_carpet_bombing() {
+        // NTP reflection sprayed across a /26 of the protected /24
+        // (carpet bombing). The rule should target the busy sub-prefix,
+        // not a single host and not the whole /24.
+        let flows: Vec<FlowRecord> = (0..64u16)
+            .map(|i| {
+                attack_flow(
+                    v4(198, 51, 100, (i % 32) as u8),
+                    v4(10, 2, 3, i as u8),
+                    123,
+                    40000 + i,
+                    17,
+                    0,
+                    8192,
+                )
+            })
+            .collect();
+
+        let rules = analyze_flows(
+            &flows,
+            prefix24(),
+            Direction::Inbound,
+            ProtocolCategory::Udp,
+            9000.0,
+            500.0,
+        );
+
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert_eq!(rule.destination_prefix, "10.2.3.0/26");
+        assert_eq!(rule.source_ports, vec![123]);
+        assert_eq!(rule.protocols, vec!["udp"]);
+    }
+
+    #[test]
+    fn single_source_udp_flood() {
+        // Unspoofed flood from one booter IP — the rule should pin both the
+        // attacker source and the targeted port.
+        let attacker = v4(198, 51, 100, 66);
+        let victim = v4(10, 2, 3, 7);
+        let flows: Vec<FlowRecord> = (0..50u16)
+            .map(|i| attack_flow(attacker, victim, 30000 + i, 80, 17, 0, 1200))
+            .collect();
+
+        let rules = analyze_flows(
+            &flows,
+            prefix24(),
+            Direction::Inbound,
+            ProtocolCategory::Udp,
+            800.0,
+            100.0,
+        );
+
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert_eq!(rule.source_prefix.as_deref(), Some("198.51.100.66/32"));
+        assert_eq!(rule.destination_prefix, "10.2.3.7/32");
+        assert_eq!(rule.destination_ports, vec![80]);
+        assert_eq!(rule.protocols, vec!["udp"]);
+    }
+
+    #[test]
+    fn multi_vector_syn_flood_plus_dns_amplification() {
+        // Simultaneous SYN flood (60% of bytes) and DNS amplification (40%).
+        // Expect one rule per vector, biggest first.
+        let victim = v4(10, 2, 3, 7);
+        let mut flows: Vec<FlowRecord> = (0..90u16)
+            .map(|i| {
+                attack_flow(
+                    v4(203, 0, 113, i as u8),
+                    victim,
+                    20000 + i,
+                    443,
+                    6,
+                    0x02,
+                    1500,
+                )
+            })
+            .collect();
+        flows.extend((0..30u16).map(|i| {
+            attack_flow(
+                v4(198, 51, 100, i as u8),
+                victim,
+                53,
+                30000 + i,
+                17,
+                0,
+                3000,
+            )
+        }));
+
+        let rules = analyze_flows(
+            &flows,
+            prefix24(),
+            Direction::Inbound,
+            ProtocolCategory::Any,
+            1000.0,
+            50.0,
+        );
+
+        assert_eq!(rules.len(), 2);
+        // Vector 1: the SYN flood
+        assert_eq!(rules[0].protocols, vec!["tcp"]);
+        assert_eq!(rules[0].destination_ports, vec![443]);
+        assert_eq!(rules[0].tcp_flags, vec!["syn"]);
+        // Vector 2: the DNS amplification
+        assert_eq!(rules[1].protocols, vec!["udp"]);
+        assert_eq!(rules[1].source_ports, vec![53]);
+    }
+
+    #[test]
+    fn stops_before_blocking_legitimate_traffic() {
+        // 96% SYN flood + 4% legitimate established HTTPS (ACK|PSH). The
+        // flood rule must match on the syn flag so legit flows survive, and
+        // once the estimated remaining rate drops below the threshold no
+        // further rules may be generated for the legitimate traffic.
+        let victim = v4(10, 2, 3, 7);
+        let mut flows: Vec<FlowRecord> = (0..96u16)
+            .map(|i| {
+                attack_flow(
+                    v4(203, 0, 113, i as u8),
+                    victim,
+                    20000 + i,
+                    443,
+                    6,
+                    0x02,
+                    1000,
+                )
+            })
+            .collect();
+        flows.extend(
+            (0..4u16).map(|i| attack_flow(v4(192, 0, 2, i as u8), victim, 50000 + i, 443, 6, 0x18, 1000)),
+        );
+
+        let rules = analyze_flows(
+            &flows,
+            prefix24(),
+            Direction::Inbound,
+            ProtocolCategory::Any,
+            1000.0,
+            100.0,
+        );
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tcp_flags, vec!["syn"]);
+    }
+
+    #[test]
+    fn icmp_flood_with_spoofed_sources_falls_back_to_protocol_rule() {
+        // An ICMP flood carries no ports or flags to pivot on, and with
+        // fully spoofed sources no field combination reaches the 10% coverage
+        // floor. The fallback must still emit "icmp to victim" from the
+        // alert's forced protocol.
+        let victim = v4(10, 2, 3, 7);
+        let flows: Vec<FlowRecord> = (0..100u16)
+            .map(|i| attack_flow(v4(203, 0, 113, i as u8), victim, 0, 0, 1, 0, 1500))
+            .collect();
+
+        let rules = analyze_flows(
+            &flows,
+            prefix24(),
+            Direction::Inbound,
+            ProtocolCategory::Icmp,
+            900.0,
+            100.0,
+        );
+
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert_eq!(rule.protocols, vec!["icmp"]);
+        assert_eq!(rule.destination_prefix, "10.2.3.7/32");
+        assert_eq!(rule.source_prefix, None);
+        assert!(rule.destination_ports.is_empty());
+        assert!(rule.source_ports.is_empty());
+        assert!(rule.tcp_flags.is_empty());
+    }
+
+    #[test]
+    fn prefers_specific_rule_when_legit_share_is_larger() {
+        // 85% SYN flood / 15% legitimate established HTTPS. A blanket
+        // {tcp, dst 443} rule covers 100%, but the syn-specific rule must
+        // win so the legitimate traffic survives.
+        let victim = v4(10, 2, 3, 7);
+        let mut flows: Vec<FlowRecord> = (0..85u16)
+            .map(|i| {
+                attack_flow(
+                    v4(203, 0, 113, i as u8),
+                    victim,
+                    20000 + i,
+                    443,
+                    6,
+                    0x02,
+                    1000,
+                )
+            })
+            .collect();
+        flows.extend(
+            (0..15u16)
+                .map(|i| attack_flow(v4(192, 0, 2, i as u8), victim, 50000 + i, 443, 6, 0x18, 1000)),
+        );
+
+        let rules = analyze_flows(
+            &flows,
+            prefix24(),
+            Direction::Inbound,
+            ProtocolCategory::Any,
+            1000.0,
+            200.0,
+        );
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].tcp_flags, vec!["syn"]);
+        assert_eq!(rules[0].destination_ports, vec![443]);
     }
 }
