@@ -74,30 +74,30 @@ struct Candidate {
 
 impl Candidate {
     fn matches(&self, flow: &FlowRecord) -> bool {
-        if let Some(ip) = self.src_ip {
-            if flow.src_ip != ip {
-                return false;
-            }
+        if let Some(ip) = self.src_ip
+            && flow.src_ip != ip
+        {
+            return false;
         }
-        if let Some(port) = self.dst_port {
-            if flow.dst_port != port {
-                return false;
-            }
+        if let Some(port) = self.dst_port
+            && flow.dst_port != port
+        {
+            return false;
         }
-        if let Some(port) = self.src_port {
-            if flow.src_port != port {
-                return false;
-            }
+        if let Some(port) = self.src_port
+            && flow.src_port != port
+        {
+            return false;
         }
-        if let Some(proto) = self.protocol {
-            if flow.protocol != proto {
-                return false;
-            }
+        if let Some(proto) = self.protocol
+            && flow.protocol != proto
+        {
+            return false;
         }
-        if let Some(flags) = self.tcp_flags {
-            if flow.tcp_flags & flags != flags {
-                return false;
-            }
+        if let Some(flags) = self.tcp_flags
+            && flow.tcp_flags & flags != flags
+        {
+            return false;
         }
         true
     }
@@ -185,15 +185,15 @@ fn compute_destination_prefix(
         *counts.entry(ip).or_insert(0) += flow.sampled_bytes();
     }
 
-    if let Some((&ip, &bytes)) = counts.iter().max_by_key(|&(_, &v)| v) {
-        if bytes as f64 / total_bytes as f64 >= dominant_ratio {
-            let host_prefix = match ip {
-                IpAddr::V4(_) => format!("{}/32", ip),
-                IpAddr::V6(_) => format!("{}/128", ip),
-            };
-            if let Ok(parsed) = host_prefix.parse() {
-                return parsed;
-            }
+    if let Some((&ip, &bytes)) = counts.iter().max_by_key(|&(_, &v)| v)
+        && bytes as f64 / total_bytes as f64 >= dominant_ratio
+    {
+        let host_prefix = match ip {
+            IpAddr::V4(_) => format!("{}/32", ip),
+            IpAddr::V6(_) => format!("{}/128", ip),
+        };
+        if let Ok(parsed) = host_prefix.parse() {
+            return parsed;
         }
     }
 
@@ -440,10 +440,10 @@ pub fn analyze_flows(
         }
 
         let mut source_ports = Vec::new();
-        if let Some(port) = candidate.src_port {
-            if port != 0 {
-                source_ports.push(port);
-            }
+        if let Some(port) = candidate.src_port
+            && port != 0
+        {
+            source_ports.push(port);
         }
 
         // Use the protocol from the candidate if discovered, otherwise use the forced
@@ -458,7 +458,7 @@ pub fn analyze_flows(
 
         let mut tcp_flags_list = candidate
             .tcp_flags
-            .map(|f| tcp_flag_names(f))
+            .map(tcp_flag_names)
             .unwrap_or_default();
 
         // For TcpSyn alerts, always include the syn flag
