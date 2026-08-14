@@ -189,22 +189,22 @@ impl FlowProcessor {
         }
     }
 
-    /// Drain captured flows for a rule matching the given prefix and direction.
-    /// Returns the flows and clears the capture buffer.
+    /// Drain captured flows for all rules matching the given prefix and
+    /// direction. Returns the flows and clears them from the capture buffers.
     pub fn drain_captured_flows(&mut self, prefix: &str, direction: Direction) -> Vec<FlowRecord> {
+        let mut flows = Vec::new();
         for rule in &mut self.rules {
             if rule.prefix.to_string() == prefix {
-                let flows: Vec<FlowRecord> = rule
-                    .capture_buffer
-                    .iter()
-                    .filter(|cf| cf.direction == direction)
-                    .map(|cf| cf.flow.clone())
-                    .collect();
+                flows.extend(
+                    rule.capture_buffer
+                        .iter()
+                        .filter(|cf| cf.direction == direction)
+                        .map(|cf| cf.flow.clone()),
+                );
                 rule.capture_buffer.retain(|cf| cf.direction != direction);
-                return flows;
             }
         }
-        Vec::new()
+        flows
     }
 
     pub fn compute_all_rates(&self, current_time: u64) -> Vec<RateSnapshot> {

@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::{Config, Direction, MetricThresholds, ProtocolCategory};
+use crate::flow::FlowRecord;
 use crate::mitigation::{self, MitigationRule};
 use crate::processor::{FlowProcessor, RateSnapshot};
 
@@ -161,9 +162,24 @@ impl AlertManager {
         }
     }
 
-    /// Build alert instances from config. Resets all alert states.
+    /// Build alert instances from config. State is carried over by
+    /// (prefix, protocol, direction, metric) so a reload does not orphan a
+    /// firing alert — resetting it to Normal would mean its resolve is never
+    /// sent and any mitigation installed by the script stays up forever.
     pub fn reload_config(&mut self, config: &Config) {
-        self.alerts.clear();
+        let mut previous: FxHashMap<
+            (String, ProtocolCategory, Direction, MetricType),
+            (AlertState, Uuid),
+        > = self
+            .alerts
+            .drain(..)
+            .map(|a| {
+                (
+                    (a.prefix, a.protocol, a.direction, a.metric),
+                    (a.state, a.alert_id),
+                )
+            })
+            .collect();
 
         // Default policy if none specified
         let default_trigger_for = Duration::from_secs(10);
@@ -202,6 +218,28 @@ impl AlertManager {
                         &rule.labels,
                     );
                 }
+            }
+        }
+
+        for alert in &mut self.alerts {
+            let key = (
+                alert.prefix.clone(),
+                alert.protocol,
+                alert.direction,
+                alert.metric,
+            );
+            if let Some((state, alert_id)) = previous.remove(&key) {
+                alert.state = state;
+                alert.alert_id = alert_id;
+            }
+        }
+
+        for ((prefix, protocol, direction, metric), (state, _)) in previous {
+            if !matches!(state, AlertState::Normal) {
+                warn!(
+                    "Alert {}/{}/{}/{} was removed by config reload while active; no resolve will be sent",
+                    prefix, protocol, direction, metric
+                );
             }
         }
 
@@ -251,11 +289,21 @@ impl AlertManager {
     /// Evaluate all alerts against current rate snapshots.
     /// When an alert fires, drains captured flows from the processor to
     /// generate BGP Flow Spec rule suggestions.
-    pub async fn evaluate(&mut self, snapshots: &[RateSnapshot], processor: &mut FlowProcessor) {
+    pub async fn evaluate(
+        &mut self,
+        snapshots: &[RateSnapshot],
+        processor: &mut FlowProcessor,
+    ) -> Vec<AlertPayload> {
         let now = Instant::now();
 
         // Collect payloads first to avoid borrow conflict
         let mut payloads = Vec::new();
+
+        // Capture buffers are drained once per (prefix, direction) this tick
+        // and shared by every alert on that key — draining per alert would
+        // hand all captured flows to whichever alert fires first and leave
+        // the others with nothing to analyze.
+        let mut drained: FxHashMap<(String, Direction), Vec<FlowRecord>> = FxHashMap::default();
 
         for alert in &mut self.alerts {
             let current_rate = find_rate(
@@ -296,14 +344,18 @@ impl AlertManager {
                 // On fire or update: analyze captured flows for mitigation suggestions
                 let mitigation_rules = if matches!(action, AlertAction::Fire | AlertAction::Update)
                 {
-                    let flows = processor.drain_captured_flows(&alert.prefix, alert.direction);
+                    let flows = drained
+                        .entry((alert.prefix.clone(), alert.direction))
+                        .or_insert_with(|| {
+                            processor.drain_captured_flows(&alert.prefix, alert.direction)
+                        });
                     if flows.is_empty() {
                         Vec::new()
                     } else {
                         match alert.prefix.parse() {
                             Ok(prefix) => {
                                 let rules = mitigation::analyze_flows(
-                                    &flows,
+                                    flows,
                                     prefix,
                                     alert.direction,
                                     alert.protocol,
@@ -337,8 +389,8 @@ impl AlertManager {
             }
         }
 
-        for payload in payloads {
-            match serde_json::to_string(&payload) {
+        for payload in &payloads {
+            match serde_json::to_string(payload) {
                 Ok(json) => {
                     info!("Alert payload: {}", json);
                     self.execute_script(json).await;
@@ -346,6 +398,8 @@ impl AlertManager {
                 Err(e) => error!("Failed to serialize alert payload: {}", e),
             }
         }
+
+        payloads
     }
 
     async fn execute_script(&self, json: String) {
@@ -417,4 +471,135 @@ fn find_rate(
         }
     }
     0.0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+    use crate::processor::FlowProcessor;
+
+    const CONFIG_YAML: &str = r#"
+global:
+  evaluation_interval: 1s
+  window: 10s
+
+alert_policies:
+  instant:
+    trigger_for: 0s
+    recover_for: 0s
+
+rules:
+  - prefix: 10.0.0.0/24
+    alert_policy: instant
+    thresholds:
+      any:
+        inbound:
+          metrics:
+            bps:
+              trigger: 100
+            pps:
+              trigger: 10
+"#;
+
+    fn test_config() -> Config {
+        serde_yaml::from_str(CONFIG_YAML).unwrap()
+    }
+
+    fn snapshot(bps: f64, pps: f64) -> RateSnapshot {
+        RateSnapshot {
+            prefix: "10.0.0.0/24".to_string(),
+            labels: FxHashMap::default(),
+            protocol: ProtocolCategory::Any,
+            direction: Direction::Inbound,
+            bps,
+            pps,
+            fps: 0.0,
+        }
+    }
+
+    #[test]
+    fn reload_preserves_alert_state() {
+        let config = test_config();
+        let mut mgr = AlertManager::new(None);
+        mgr.reload_config(&config);
+        assert_eq!(mgr.alerts.len(), 2);
+
+        let id = Uuid::new_v4();
+        let idx = mgr
+            .alerts
+            .iter()
+            .position(|a| a.metric == MetricType::Bps)
+            .unwrap();
+        mgr.alerts[idx].state = AlertState::Firing {
+            last_update: Instant::now(),
+        };
+        mgr.alerts[idx].alert_id = id;
+
+        mgr.reload_config(&config);
+
+        let firing = mgr
+            .alerts
+            .iter()
+            .find(|a| a.metric == MetricType::Bps)
+            .unwrap();
+        assert!(matches!(firing.state, AlertState::Firing { .. }));
+        assert_eq!(firing.alert_id, id);
+
+        let other = mgr
+            .alerts
+            .iter()
+            .find(|a| a.metric == MetricType::Pps)
+            .unwrap();
+        assert!(matches!(other.state, AlertState::Normal));
+    }
+
+    #[tokio::test]
+    async fn concurrent_alerts_share_captured_flows() {
+        let config = test_config();
+        let mut processor = FlowProcessor::new(10);
+        processor.reload_config(&config).unwrap();
+
+        // Capture a DNS-amplification-shaped batch of inbound flows.
+        for i in 0..50u16 {
+            let flow = FlowRecord {
+                src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, i as u8)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+                src_port: 53,
+                dst_port: 30000 + i,
+                protocol: 17,
+                tcp_flags: 0,
+                bytes: 4096,
+                packets: 1,
+                time_received: 1000,
+                sampling_rate: 1,
+            };
+            processor.process_flow(&flow);
+        }
+
+        let mut mgr = AlertManager::new(None);
+        mgr.reload_config(&config);
+
+        let snapshots = vec![snapshot(1_000_000.0, 100_000.0)];
+
+        // First pass arms both alerts (Normal → Pending)...
+        let payloads = mgr.evaluate(&snapshots, &mut processor).await;
+        assert!(payloads.is_empty());
+
+        // ...second pass fires both (trigger_for is 0s). Both the bps and
+        // pps alert must get mitigation rules from the shared capture
+        // buffer, not just whichever drained it first.
+        let payloads = mgr.evaluate(&snapshots, &mut processor).await;
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            assert_eq!(payload.action, "trigger");
+            assert!(
+                !payload.mitigation_rules.is_empty(),
+                "alert {}/{} lost the captured flows",
+                payload.metric,
+                payload.prefix
+            );
+        }
+    }
 }
