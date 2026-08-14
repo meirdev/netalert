@@ -163,8 +163,13 @@ impl GroupKey {
 
 /// Compute the most specific destination prefix for a set of flows.
 /// For inbound traffic, looks at dst_ip; for outbound, looks at src_ip.
-/// If a single host accounts for >= `dominant_ratio` of total bytes, returns
-/// that host as a /32 (or /128). Otherwise returns the full rule prefix.
+///
+/// Descends the binary prefix tree starting from `prefix`: at each step, if
+/// one half of the current prefix carries >= `dominant_ratio` of total bytes,
+/// narrows to that half. Stops when traffic is spread across both halves.
+/// Returns the narrowest qualifying sub-prefix — down to a single host
+/// (/32 or /128) when one address dominates, e.g. 10.2.3.0/28 out of a
+/// 10.2.3.0/24 rule prefix.
 fn compute_destination_prefix(
     flows: &[FlowRecord],
     direction: Direction,
@@ -185,19 +190,39 @@ fn compute_destination_prefix(
         *counts.entry(ip).or_insert(0) += flow.sampled_bytes();
     }
 
-    if let Some((&ip, &bytes)) = counts.iter().max_by_key(|&(_, &v)| v)
-        && bytes as f64 / total_bytes as f64 >= dominant_ratio
-    {
-        let host_prefix = match ip {
-            IpAddr::V4(_) => format!("{}/32", ip),
-            IpAddr::V6(_) => format!("{}/128", ip),
+    let max_len = match prefix {
+        IpNet::V4(_) => 32,
+        IpNet::V6(_) => 128,
+    };
+
+    let mut current = prefix.trunc();
+    while current.prefix_len() < max_len {
+        let Ok(children) = current.subnets(current.prefix_len() + 1) else {
+            break;
         };
-        if let Ok(parsed) = host_prefix.parse() {
-            return parsed;
+
+        // Find the busier half and descend into it if it still carries the
+        // dominant share of all captured traffic.
+        let busiest = children
+            .map(|child| {
+                let bytes: u64 = counts
+                    .iter()
+                    .filter(|(ip, _)| child.contains(*ip))
+                    .map(|(_, bytes)| *bytes)
+                    .sum();
+                (child, bytes)
+            })
+            .max_by_key(|&(_, bytes)| bytes);
+
+        match busiest {
+            Some((child, bytes)) if bytes as f64 / total_bytes as f64 >= dominant_ratio => {
+                current = child;
+            }
+            _ => break,
         }
     }
 
-    prefix
+    current
 }
 
 fn proto_number(cat: ProtocolCategory) -> u8 {
@@ -496,4 +521,56 @@ pub fn analyze_flows(
     }
 
     rules
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    fn flow(dst: [u8; 4], bytes: u64) -> FlowRecord {
+        FlowRecord {
+            src_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::from(dst)),
+            src_port: 1234,
+            dst_port: 80,
+            protocol: 6,
+            tcp_flags: 0x02,
+            bytes,
+            packets: 1,
+            time_received: 0,
+            sampling_rate: 1,
+        }
+    }
+
+    #[test]
+    fn narrows_to_busiest_sub_prefix() {
+        // Traffic spread evenly across 10.2.3.1-14 — all inside 10.2.3.0/28,
+        // but the /29 halves are balanced, so descent stops at /28.
+        let flows: Vec<FlowRecord> = (1..=14).map(|i| flow([10, 2, 3, i], 100)).collect();
+        let prefix: IpNet = "10.2.3.0/24".parse().unwrap();
+
+        let result = compute_destination_prefix(&flows, Direction::Inbound, prefix, 0.8);
+        assert_eq!(result, "10.2.3.0/28".parse::<IpNet>().unwrap());
+    }
+
+    #[test]
+    fn narrows_to_single_host_when_one_dominates() {
+        let flows = vec![flow([10, 2, 3, 7], 10_000), flow([10, 2, 3, 200], 100)];
+        let prefix: IpNet = "10.2.3.0/24".parse().unwrap();
+
+        let result = compute_destination_prefix(&flows, Direction::Inbound, prefix, 0.8);
+        assert_eq!(result, "10.2.3.7/32".parse::<IpNet>().unwrap());
+    }
+
+    #[test]
+    fn keeps_full_prefix_when_traffic_is_spread() {
+        // The /25 halves are balanced, so no sub-prefix qualifies.
+        let flows = vec![flow([10, 2, 3, 10], 100), flow([10, 2, 3, 200], 100)];
+        let prefix: IpNet = "10.2.3.0/24".parse().unwrap();
+
+        let result = compute_destination_prefix(&flows, Direction::Inbound, prefix, 0.8);
+        assert_eq!(result, prefix);
+    }
 }
