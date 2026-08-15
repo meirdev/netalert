@@ -149,6 +149,17 @@ impl AlertInstance {
     }
 }
 
+/// Snapshot of an alert instance's state for the metrics endpoint.
+#[derive(Debug, Clone)]
+pub struct AlertStateSnapshot {
+    pub prefix: String,
+    pub protocol: ProtocolCategory,
+    pub direction: Direction,
+    pub metric: MetricType,
+    /// 0=normal, 1=pending, 2=firing, 3=recovering
+    pub state: u8,
+}
+
 pub struct AlertManager {
     pub alerts: Vec<AlertInstance>,
     pub script_path: Option<PathBuf>,
@@ -400,6 +411,25 @@ impl AlertManager {
         }
 
         payloads
+    }
+
+    /// Current state of every alert instance, for the metrics endpoint.
+    pub fn state_snapshots(&self) -> Vec<AlertStateSnapshot> {
+        self.alerts
+            .iter()
+            .map(|a| AlertStateSnapshot {
+                prefix: a.prefix.clone(),
+                protocol: a.protocol,
+                direction: a.direction,
+                metric: a.metric,
+                state: match a.state {
+                    AlertState::Normal => 0,
+                    AlertState::Pending { .. } => 1,
+                    AlertState::Firing { .. } => 2,
+                    AlertState::Recovering { .. } => 3,
+                },
+            })
+            .collect()
     }
 
     async fn execute_script(&self, json: String) {

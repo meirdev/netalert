@@ -328,9 +328,9 @@ fn find_best_candidate(
             // legitimate traffic that differs in that field (e.g. established
             // HTTPS vs a SYN flood). A large coverage drop still loses.
             // Example: {protocol=tcp, dst_port=443} at 100% scores 1.0*2.0=2.0
-            //          {protocol, dst_port, tcp_flags=syn} at 85% scores 0.85*2.5=2.125 ← wins
-            //          {src_ip=X, protocol, dst_port} at 10% scores 0.1*2.5=0.25 ← too
-            // narrow
+            //          {protocol, dst_port, tcp_flags=syn} at 85% scores 0.85*2.5=2.125 ←
+            // wins          {src_ip=X, protocol, dst_port} at 10% scores
+            // 0.1*2.5=0.25 ← too narrow
             let score = coverage * (1.0 + 0.5 * candidate.fields.count() as f64);
 
             let dominated = match &best {
@@ -503,10 +503,7 @@ pub fn analyze_flows(
             Vec::new()
         };
 
-        let mut tcp_flags_list = candidate
-            .tcp_flags
-            .map(tcp_flag_names)
-            .unwrap_or_default();
+        let mut tcp_flags_list = candidate.tcp_flags.map(tcp_flag_names).unwrap_or_default();
 
         // For TcpSyn alerts, always include the syn flag
         if protocol_filter == ProtocolCategory::TcpSyn && tcp_flags_list.is_empty() {
@@ -832,9 +829,17 @@ mod tests {
                 )
             })
             .collect();
-        flows.extend(
-            (0..4u16).map(|i| attack_flow(v4(192, 0, 2, i as u8), victim, 50000 + i, 443, 6, 0x18, 1000)),
-        );
+        flows.extend((0..4u16).map(|i| {
+            attack_flow(
+                v4(192, 0, 2, i as u8),
+                victim,
+                50000 + i,
+                443,
+                6,
+                0x18,
+                1000,
+            )
+        }));
 
         let rules = analyze_flows(
             &flows,
@@ -898,10 +903,17 @@ mod tests {
                 )
             })
             .collect();
-        flows.extend(
-            (0..15u16)
-                .map(|i| attack_flow(v4(192, 0, 2, i as u8), victim, 50000 + i, 443, 6, 0x18, 1000)),
-        );
+        flows.extend((0..15u16).map(|i| {
+            attack_flow(
+                v4(192, 0, 2, i as u8),
+                victim,
+                50000 + i,
+                443,
+                6,
+                0x18,
+                1000,
+            )
+        }));
 
         let rules = analyze_flows(
             &flows,

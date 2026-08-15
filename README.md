@@ -27,6 +27,7 @@ Options:
   --bind-addr <ADDR>        Bind address [default: 0.0.0.0]
   --log-level <LEVEL>       Log level [default: info]
   --metrics-addr <ADDR>     Prometheus metrics address [default: 0.0.0.0:9090]
+  --check-config            Validate the config file and exit
 ```
 
 ## Configuration
@@ -125,6 +126,18 @@ netalert_fps{prefix="10.0.0.0/24",protocol="tcp",direction="inbound",segment="cu
 ```
 
 Rule labels are included as metric dimensions.
+
+Internal health metrics are also exposed:
+
+```
+netalert_alert_state{prefix="10.0.0.0/24",protocol="any",direction="inbound",metric="bps"} 2
+netalert_flows_received_total{source="netflow"} 1234567
+netalert_flows_dropped_total 0
+netalert_flow_channel_depth 12
+netalert_evaluation_duration_seconds 0.0015
+```
+
+`netalert_alert_state` reflects each alert's state machine: 0=normal, 1=pending, 2=firing, 3=recovering. `netalert_flows_dropped_total` counts flows discarded because the processing channel was full — a nonzero rate means the processor can't keep up with ingest.
 
 ## Architecture
 

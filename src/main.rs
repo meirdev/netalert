@@ -10,6 +10,7 @@ mod utils;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -45,6 +46,10 @@ struct Args {
 
     #[arg(long, default_value = "0.0.0.0:9090")]
     metrics_addr: String,
+
+    /// Validate the config file and exit
+    #[arg(long)]
+    check_config: bool,
 }
 
 type SharedAlertManager = Arc<Mutex<AlertManager>>;
@@ -53,6 +58,25 @@ type ExporterRates = Arc<RwLock<FxHashMap<IpAddr, u32>>>;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.check_config {
+        match Config::load(&args.config) {
+            Ok(config) => {
+                println!(
+                    "Config OK: {:?} ({} rules, {} alert policies, {} exporters)",
+                    args.config,
+                    config.rules.len(),
+                    config.alert_policies.len(),
+                    config.exporters.len()
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Config check failed: {:#}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level));
@@ -88,9 +112,16 @@ async fn main() -> Result<()> {
 
     let shared_processor = new_shared_processor(window_secs);
     let shared_snapshots: SharedSnapshots = prometheus::new_shared_snapshots();
+    let shared_alert_states = prometheus::new_shared_alert_states();
+    let health = prometheus::new_shared_health();
 
     // Start Prometheus metrics endpoint
-    prometheus::spawn(args.metrics_addr.clone(), shared_snapshots.clone());
+    prometheus::spawn(
+        args.metrics_addr.clone(),
+        shared_snapshots.clone(),
+        shared_alert_states.clone(),
+        health.clone(),
+    );
 
     // Initialize processor and alert manager from config
     shared_processor.write().await.reload_config(&config)?;
@@ -103,33 +134,49 @@ async fn main() -> Result<()> {
 
     let flow_tx_netflow = flow_tx.clone();
     let rates_netflow = exporter_rates.clone();
+    let health_netflow = health.clone();
     let _netflow_handle = tokio::spawn(async move {
-        if let Err(e) = run_netflow_receiver(&netflow_addr, flow_tx_netflow, rates_netflow).await {
+        if let Err(e) = run_netflow_receiver(
+            &netflow_addr,
+            flow_tx_netflow,
+            rates_netflow,
+            health_netflow,
+        )
+        .await
+        {
             error!("NetFlow receiver error: {}", e);
         }
     });
 
     let flow_tx_sflow = flow_tx.clone();
     let rates_sflow = exporter_rates.clone();
+    let health_sflow = health.clone();
     let _sflow_handle = tokio::spawn(async move {
-        if let Err(e) = run_sflow_receiver(&sflow_addr, flow_tx_sflow, rates_sflow).await {
+        if let Err(e) =
+            run_sflow_receiver(&sflow_addr, flow_tx_sflow, rates_sflow, health_sflow).await
+        {
             error!("sFlow receiver error: {}", e);
         }
     });
 
     let processor_clone = shared_processor.clone();
+    let health_processor = health.clone();
     let _processor_handle = tokio::spawn(async move {
-        run_flow_processor(flow_rx, processor_clone).await;
+        run_flow_processor(flow_rx, processor_clone, health_processor).await;
     });
 
     let processor_for_ticker = shared_processor.clone();
     let alert_for_ticker = alert_manager.clone();
     let snapshots_for_ticker = shared_snapshots.clone();
+    let alert_states_for_ticker = shared_alert_states.clone();
+    let health_ticker = health.clone();
     let _ticker_handle = tokio::spawn(async move {
         run_ticker(
             processor_for_ticker,
             alert_for_ticker,
             snapshots_for_ticker,
+            alert_states_for_ticker,
+            health_ticker,
             evaluation_interval,
         )
         .await;
@@ -213,6 +260,7 @@ async fn run_netflow_receiver(
     bind_addr: &str,
     tx: mpsc::Sender<FlowRecord>,
     exporter_rates: ExporterRates,
+    health: prometheus::SharedHealth,
 ) -> Result<()> {
     info!("Starting NetFlow/IPFIX listener on {}", bind_addr);
     let reader = rustflow::tokio::NetflowReader::bind(bind_addr).await?;
@@ -221,6 +269,7 @@ async fn run_netflow_receiver(
         AnyFlowReader::Netflow(reader),
         tx,
         exporter_rates,
+        health,
     )
     .await
 }
@@ -229,10 +278,18 @@ async fn run_sflow_receiver(
     bind_addr: &str,
     tx: mpsc::Sender<FlowRecord>,
     exporter_rates: ExporterRates,
+    health: prometheus::SharedHealth,
 ) -> Result<()> {
     info!("Starting sFlow listener on {}", bind_addr);
     let reader = rustflow::tokio::SflowReader::bind(bind_addr).await?;
-    run_receiver_loop("sFlow", AnyFlowReader::Sflow(reader), tx, exporter_rates).await
+    run_receiver_loop(
+        "sFlow",
+        AnyFlowReader::Sflow(reader),
+        tx,
+        exporter_rates,
+        health,
+    )
+    .await
 }
 
 async fn run_receiver_loop(
@@ -240,10 +297,18 @@ async fn run_receiver_loop(
     mut reader: AnyFlowReader,
     tx: mpsc::Sender<FlowRecord>,
     exporter_rates: ExporterRates,
+    health: prometheus::SharedHealth,
 ) -> Result<()> {
+    let received_counter = match reader {
+        AnyFlowReader::Netflow(_) => &health.flows_received_netflow,
+        AnyFlowReader::Sflow(_) => &health.flows_received_sflow,
+    };
+
     loop {
         match reader.read().await {
             Ok(common_flow) => {
+                received_counter.fetch_add(1, Ordering::Relaxed);
+
                 let mut flow = FlowRecord::from_common_flow(&common_flow);
 
                 // Override sampling rate from exporter config if available
@@ -254,9 +319,18 @@ async fn run_receiver_loop(
                     }
                 }
 
-                if tx.send(flow).await.is_err() {
-                    warn!("Flow channel closed");
-                    return Ok(());
+                // Drop (and count) rather than block when the channel is
+                // full: a stalled reader would let the kernel UDP buffer
+                // overflow invisibly instead.
+                match tx.try_send(flow) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        health.flows_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("Flow channel closed");
+                        return Ok(());
+                    }
                 }
             }
             Err(e) => {
@@ -266,10 +340,17 @@ async fn run_receiver_loop(
     }
 }
 
-async fn run_flow_processor(mut rx: mpsc::Receiver<FlowRecord>, processor: SharedProcessor) {
+async fn run_flow_processor(
+    mut rx: mpsc::Receiver<FlowRecord>,
+    processor: SharedProcessor,
+    health: prometheus::SharedHealth,
+) {
     info!("Flow processor started");
 
     while let Some(flow) = rx.recv().await {
+        health
+            .flow_channel_depth
+            .store(rx.len() as u64, Ordering::Relaxed);
         let mut proc = processor.write().await;
         proc.process_flow(&flow);
     }
@@ -281,6 +362,8 @@ async fn run_ticker(
     processor: SharedProcessor,
     alert_manager: SharedAlertManager,
     shared_snapshots: SharedSnapshots,
+    shared_alert_states: prometheus::SharedAlertStates,
+    health: prometheus::SharedHealth,
     evaluation_interval: std::time::Duration,
 ) {
     info!(
@@ -298,22 +381,27 @@ async fn run_ticker(
 
         // Compute rates and evaluate alerts together under write lock
         // (alert evaluation needs mutable access to drain capture buffers)
-        let snapshots = {
+        let (snapshots, alert_states) = {
             let mut proc = processor.write().await;
             let snapshots = proc.compute_all_rates(current_time);
-            {
+            let alert_states = {
                 let mut am = alert_manager.lock().await;
                 am.evaluate(&snapshots, &mut proc).await;
-            }
-            snapshots
+                am.state_snapshots()
+            };
+            (snapshots, alert_states)
         };
 
         let elapsed = eval_start.elapsed();
+        health
+            .evaluation_duration_micros
+            .store(elapsed.as_micros() as u64, Ordering::Relaxed);
         if elapsed.as_secs() >= 1 {
             warn!("Evaluation took {}ms", elapsed.as_millis());
         }
 
         // Publish snapshots for Prometheus endpoint
         *shared_snapshots.write().unwrap() = snapshots;
+        *shared_alert_states.write().unwrap() = alert_states;
     }
 }
